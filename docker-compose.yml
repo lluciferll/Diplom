@@ -11,13 +11,20 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   backend:
     build:
-      context: ./backend
+      context: .
+      dockerfile: backend/Dockerfile
     container_name: diploma_backend
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     environment:
       PORT: 4000
       JWT_SECRET: super-secret-key
