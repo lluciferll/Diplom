@@ -1,25 +1,65 @@
 const express = require("express");
+require("express-async-errors");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const multer = require("multer");
+const rateLimit = require("express-rate-limit");
 const { PrismaClient, Role, TaskStatus, Priority, ProjectMemberRole } = require("@prisma/client");
 const { z } = require("zod");
 
 dotenv.config();
+
+const NODE_ENV = process.env.NODE_ENV || "development";
+
+function resolveJwtSecret() {
+  const fromEnv = process.env.JWT_SECRET ? String(process.env.JWT_SECRET).trim() : "";
+  if (fromEnv.length >= 16) return fromEnv;
+  if (NODE_ENV === "production") {
+    console.error("[fatal] Set JWT_SECRET in the environment (at least 16 characters) before running in production.");
+    process.exit(1);
+  }
+  if (fromEnv.length >= 8) return fromEnv;
+  console.warn("[security] JWT_SECRET is unset or short — tokens are insecure for demo/dev only.");
+  return fromEnv || "super-secret-dev-only";
+}
+
+const JWT_SECRET = resolveJwtSecret();
 
 const app = express();
 const prisma = new PrismaClient();
 
 app.use(cors());
 app.use(express.json());
+
+/* Request tracing + structured access log line */
+app.use((req, res, next) => {
+  const id = crypto.randomUUID();
+  req.requestId = id;
+  res.setHeader("X-Request-ID", id);
+  const started = Date.now();
+  res.on("finish", () => {
+    const ms = Date.now() - started;
+    console.info(`[${req.requestId}] ${req.method} ${req.originalUrl || req.url} ${res.statusCode} ${ms}ms`);
+  });
+  next();
+});
+
 app.use("/uploads", express.static(path.join(__dirname, "..", "uploads")));
 
 const PORT = Number(process.env.PORT || 4000);
-const JWT_SECRET = process.env.JWT_SECRET || "super-secret-key";
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: NODE_ENV === "test" ? 1000 : 80,
+  message: { message: "Слишком много попыток входа. Попробуйте через несколько минут." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 function signToken(user) {
   return jwt.sign({ id: user.id, role: user.role, email: user.email, name: user.name }, JWT_SECRET, { expiresIn: "8h" });
@@ -68,7 +108,17 @@ async function requireProjectRole(req, res, projectId, minRole = ProjectMemberRo
     res.status(403).json({ message: "Нет доступа к проекту" });
     return false;
   }
-  if (roleRank(membership.role) < roleRank(minRole)) {
+  let effectiveRank = roleRank(membership.role);
+  // Глобальный MANAGER трактуется как менеджер проекта для операций с minRole MANAGER,
+  // если он в составе проекта хотя бы как участник (не только наблюдатель).
+  if (
+    req.user.role === Role.MANAGER &&
+    roleRank(minRole) >= roleRank(ProjectMemberRole.MANAGER) &&
+    effectiveRank >= roleRank(ProjectMemberRole.MEMBER)
+  ) {
+    effectiveRank = Math.max(effectiveRank, roleRank(ProjectMemberRole.MANAGER));
+  }
+  if (effectiveRank < roleRank(minRole)) {
     res.status(403).json({ message: "Недостаточно прав в проекте" });
     return false;
   }
@@ -76,20 +126,28 @@ async function requireProjectRole(req, res, projectId, minRole = ProjectMemberRo
 }
 
 async function addHistory(taskId, authorId, action, details) {
-  await prisma.taskHistory.create({
-    data: {
-      taskId,
-      authorId,
-      action,
-      details: details ? JSON.stringify(details) : null,
-    },
-  });
+  try {
+    await prisma.taskHistory.create({
+      data: {
+        taskId,
+        authorId,
+        action,
+        details: details ? JSON.stringify(details) : null,
+      },
+    });
+  } catch (err) {
+    console.error("[addHistory]", err);
+  }
 }
 
 async function notifyUser(userId, title, message, taskId) {
-  await prisma.notification.create({
-    data: { userId, title, message, taskId },
-  });
+  try {
+    await prisma.notification.create({
+      data: { userId, title, message, taskId },
+    });
+  } catch (err) {
+    console.error("[notifyUser]", err);
+  }
 }
 
 const uploadsDir = path.join(__dirname, "..", "uploads");
@@ -105,9 +163,27 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
 });
 
+const taskIncludeFull = {
+  assignee: { select: { id: true, name: true, email: true, role: true } },
+  comments: { include: { author: { select: { id: true, name: true } } }, orderBy: { createdAt: "asc" } },
+  timeLogs: true,
+  checklist: { orderBy: { createdAt: "asc" } },
+  tags: { include: { tag: true } },
+  attachments: true,
+  history: { orderBy: { createdAt: "desc" }, take: 20 },
+};
+
+/** ID исполнителя из JSON иногда приходит строкой — приводим к числу, как в HTML select. */
+const assigneeIdField = z.preprocess((v) => {
+  if (v === undefined) return undefined;
+  if (v === null || v === "") return null;
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : v;
+}, z.number().int().positive().nullable().optional());
+
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-app.post("/auth/register", async (req, res) => {
+app.post("/auth/register", authLimiter, async (req, res) => {
   const schema = z.object({
     email: z.string().email(),
     name: z.string().min(2),
@@ -128,7 +204,7 @@ app.post("/auth/register", async (req, res) => {
   res.status(201).json({ token, user: { id: user.id, email: user.email, name: user.name, role: user.role } });
 });
 
-app.post("/auth/login", async (req, res) => {
+app.post("/auth/login", authLimiter, async (req, res) => {
   const schema = z.object({ email: z.string().email(), password: z.string().min(6) });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json(parsed.error.flatten());
@@ -347,7 +423,7 @@ app.post("/tasks", auth, allowRoles(Role.ADMIN, Role.MANAGER, Role.EXECUTOR), as
     title: z.string().min(2),
     description: z.string().optional(),
     projectId: z.number(),
-    assigneeId: z.number().optional(),
+    assigneeId: assigneeIdField,
     dueDate: z.string().datetime().optional(),
     priority: z.nativeEnum(Priority).optional(),
     status: z.nativeEnum(TaskStatus).optional(),
@@ -382,15 +458,7 @@ app.post("/tasks", auth, allowRoles(Role.ADMIN, Role.MANAGER, Role.EXECUTOR), as
   }
   const taskWithExtras = await prisma.task.findUnique({
     where: { id: task.id },
-    include: {
-      assignee: { select: { id: true, name: true, email: true, role: true } },
-      comments: { include: { author: { select: { id: true, name: true } } }, orderBy: { createdAt: "asc" } },
-      timeLogs: true,
-      checklist: { orderBy: { createdAt: "asc" } },
-      tags: { include: { tag: true } },
-      attachments: true,
-      history: { orderBy: { createdAt: "desc" }, take: 20 },
-    },
+    include: taskIncludeFull,
   });
   await addHistory(task.id, req.user.id, "TASK_CREATED", { title: task.title });
   if (task.assigneeId && task.dueDate) {
@@ -399,12 +467,23 @@ app.post("/tasks", auth, allowRoles(Role.ADMIN, Role.MANAGER, Role.EXECUTOR), as
   res.status(201).json(taskWithExtras);
 });
 
+app.get("/tasks/:id", auth, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ message: "Некорректный идентификатор задачи" });
+  const stub = await prisma.task.findUnique({ where: { id }, select: { id: true, projectId: true, archivedAt: true } });
+  if (!stub || stub.archivedAt) return res.status(404).json({ message: "Задача не найдена" });
+  const allowed = await requireProjectRole(req, res, stub.projectId, ProjectMemberRole.VIEWER);
+  if (!allowed) return;
+  const full = await prisma.task.findUnique({ where: { id }, include: taskIncludeFull });
+  res.json(full);
+});
+
 app.put("/tasks/:id", auth, async (req, res) => {
   const id = Number(req.params.id);
   const schema = z.object({
     title: z.string().min(2).optional(),
     description: z.string().nullable().optional(),
-    assigneeId: z.number().nullable().optional(),
+    assigneeId: assigneeIdField,
     dueDate: z.string().datetime().nullable().optional(),
     priority: z.nativeEnum(Priority).optional(),
     status: z.nativeEnum(TaskStatus).optional(),
@@ -440,16 +519,11 @@ app.put("/tasks/:id", auth, async (req, res) => {
   }
   const updated = await prisma.task.findUnique({
     where: { id },
-    include: {
-      assignee: { select: { id: true, name: true, email: true, role: true } },
-      comments: { include: { author: { select: { id: true, name: true } } }, orderBy: { createdAt: "asc" } },
-      timeLogs: true,
-      checklist: { orderBy: { createdAt: "asc" } },
-      tags: { include: { tag: true } },
-      attachments: true,
-      history: { orderBy: { createdAt: "desc" }, take: 20 },
-    },
+    include: taskIncludeFull,
   });
+  if (!updated) {
+    return res.status(500).json({ message: "Не удалось загрузить задачу после сохранения" });
+  }
   await addHistory(updated.id, req.user.id, "TASK_UPDATED", {
     status: restData.status,
     assigneeId: assigneeId,
@@ -636,6 +710,14 @@ app.post("/notifications/scan", auth, async (req, res) => {
   res.json({ created: tasks.length });
 });
 
+app.post("/notifications/read-all", auth, async (req, res) => {
+  await prisma.notification.updateMany({
+    where: { userId: req.user.id, read: false },
+    data: { read: true },
+  });
+  res.status(204).send();
+});
+
 app.get("/notifications", auth, async (req, res) => {
   const notifications = await prisma.notification.findMany({
     where: { userId: req.user.id },
@@ -647,6 +729,8 @@ app.get("/notifications", auth, async (req, res) => {
 
 app.put("/notifications/:id/read", auth, async (req, res) => {
   const id = Number(req.params.id);
+  const owned = await prisma.notification.findFirst({ where: { id, userId: req.user.id } });
+  if (!owned) return res.status(404).json({ message: "Не найдено" });
   const item = await prisma.notification.update({
     where: { id },
     data: { read: true },
@@ -658,8 +742,23 @@ app.get("/projects/:id/export.csv", auth, async (req, res) => {
   const projectId = Number(req.params.id);
   const allowed = await requireProjectRole(req, res, projectId, ProjectMemberRole.VIEWER);
   if (!allowed) return;
+
+  const createdAt = {};
+  if (typeof req.query.createdAfter === "string" && req.query.createdAfter.trim()) {
+    const d = new Date(req.query.createdAfter.trim());
+    if (!Number.isNaN(d.getTime())) createdAt.gte = d;
+  }
+  if (typeof req.query.createdBefore === "string" && req.query.createdBefore.trim()) {
+    const d = new Date(req.query.createdBefore.trim());
+    if (!Number.isNaN(d.getTime())) createdAt.lte = d;
+  }
+
   const tasks = await prisma.task.findMany({
-    where: { projectId, archivedAt: null },
+    where: {
+      projectId,
+      archivedAt: null,
+      ...(Object.keys(createdAt).length ? { createdAt } : {}),
+    },
     include: { assignee: true, tags: { include: { tag: true } }, timeLogs: true },
     orderBy: { createdAt: "asc" },
   });
@@ -686,6 +785,10 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ message: "Internal server error" });
 });
 
-app.listen(PORT, () => {
-  console.log(`API started on port ${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`API started on port ${PORT}`);
+  });
+}
+
+module.exports = app;

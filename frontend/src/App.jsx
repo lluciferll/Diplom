@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, useRef } from "react";
-import { api, setToken, API_BASE } from "./api";
+import { api, setNetworkErrorNotifier, setToken, API_BASE } from "./api";
 
 const STATUS_COLUMNS = ["TODO", "IN_PROGRESS", "REVIEW", "DONE"];
 const STATUS_LABELS = {
@@ -17,6 +17,41 @@ function extractAuthError(err) {
   if (data?.message) return data.message;
   if (!err?.response) return "Сервер недоступен. Проверьте, что backend запущен на localhost:4000.";
   return "Ошибка аутентификации";
+}
+
+function extractApiErrorMessage(err) {
+  const data = err?.response?.data;
+  if (typeof data?.message === "string") return data.message;
+  if (typeof data === "string") return data;
+  if (!err?.response && err?.message) return err.message;
+  if (!err?.response) return "Сервер недоступен. Проверьте соединение и что backend запущен.";
+  return "Запрос не выполнен";
+}
+
+function parseWorkspaceQuery() {
+  if (typeof window === "undefined") return { projectId: null, taskId: null };
+  const u = new URL(window.location.href);
+  const project = Number(u.searchParams.get("project"));
+  const task = Number(u.searchParams.get("task"));
+  return {
+    projectId: Number.isFinite(project) && project > 0 ? project : null,
+    taskId: Number.isFinite(task) && task > 0 ? task : null,
+  };
+}
+
+/** Синхронизирует ?project=&task= с текущим экраном (без новой записи в истории браузера). */
+function replaceWorkspaceLocation(projectId, taskId, taskProjectId = null) {
+  if (typeof window === "undefined") return;
+  const u = new URL(window.location.href);
+  if (projectId != null && projectId !== "") {
+    u.searchParams.set("project", String(projectId));
+  } else {
+    u.searchParams.delete("project");
+  }
+  const showTask = taskId != null && taskId !== "" && (taskProjectId == null || Number(taskProjectId) === Number(projectId));
+  if (showTask) u.searchParams.set("task", String(taskId));
+  else u.searchParams.delete("task");
+  window.history.replaceState({}, "", `${u.pathname}${u.search}`);
 }
 
 function AuthForm({ onAuth }) {
@@ -102,10 +137,138 @@ const BellIcon = () => (
   </svg>
 );
 
+const PanelLeftIcon = () => (
+  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <path d="M10 4v16" />
+  </svg>
+);
+
+const PanelOpenIcon = () => (
+  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <path d="M10 4v16M16 9l2 3-2 3" />
+  </svg>
+);
+
+const LinkIcon = () => (
+  <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
+    <path d="M10 13a5 5 0 0 1 7-7l2 2a5 5 0 0 1-7 7" />
+    <path d="M14 11a5 5 0 0 0-7-7l-2 2a5 5 0 0 0 7 7" />
+  </svg>
+);
+
+function WorkspaceSkeleton() {
+  return (
+    <div className="workspace-skeleton" aria-busy="true" aria-label="Загрузка сводки и фильтров">
+      <div className="sk-pills-row">
+        {[1, 2, 3, 4, 5, 6].map((k) => (
+          <span key={k} className="sk-pill" />
+        ))}
+      </div>
+      <div className="sk-search-card">
+        <span className="sk-line sk-line-wide" />
+        <div className="sk-chips-row">
+          {[1, 2, 3, 4, 5].map((k) => (
+            <span key={k} className="sk-chip" />
+          ))}
+        </div>
+      </div>
+      <span className="sk-line sk-line-mid" />
+      <span className="sk-line sk-line-short" />
+    </div>
+  );
+}
+
+function BoardSkeleton() {
+  return (
+    <div className="board-region board-surface board-skeleton-wrap" aria-hidden>
+      <div className="sk-board-toolbar" />
+      <div className="board board-skeleton-cols">
+        {[0, 1, 2, 3].map((col) => (
+          <div key={col} className="column card sk-column">
+            <div className="sk-col-head" />
+            <span className="sk-card-bar" />
+            <span className="sk-card-bar sk-card-bar-short" />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ConfirmModal({ config, onClose, notifyError }) {
+  const [busy, setBusy] = useState(false);
+  const cancelRef = useRef(null);
+
+  useEffect(() => {
+    if (!config) return undefined;
+    cancelRef.current?.focus();
+    function onDocKey(e) {
+      if (e.key === "Escape" && !busy) {
+        onClose();
+      }
+    }
+    document.addEventListener("keydown", onDocKey);
+    return () => document.removeEventListener("keydown", onDocKey);
+  }, [config, busy, onClose]);
+
+  if (!config) return null;
+
+  async function confirm() {
+    setBusy(true);
+    try {
+      await config.action();
+      onClose();
+    } catch (err) {
+      notifyError?.(extractApiErrorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      className={`modal-overlay confirm-overlay${config.danger ? " confirm-overlay--danger" : ""}`}
+      role="presentation"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget && !busy) onClose();
+      }}
+    >
+      <div
+        className="confirm-dialog card"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="confirm-dialog-title"
+        aria-describedby={config.description ? "confirm-dialog-desc" : undefined}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <h2 id="confirm-dialog-title" className="confirm-dialog-title">
+          {config.title}
+        </h2>
+        {config.description ? (
+          <p id="confirm-dialog-desc" className="confirm-dialog-desc">
+            {config.description}
+          </p>
+        ) : null}
+        <div className="confirm-dialog-actions">
+          <button ref={cancelRef} type="button" className="ghost" disabled={busy} onClick={() => !busy && onClose()}>
+            {config.cancelText || "Отмена"}
+          </button>
+          <button type="button" className={config.danger ? "danger" : undefined} disabled={busy} onClick={() => confirm()}>
+            {busy ? "Подождите…" : config.confirmText || "Продолжить"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function TaskModal({
   task,
   users,
   tags,
+  initialStatus,
   onClose,
   onSave,
   onComment,
@@ -116,12 +279,16 @@ function TaskModal({
   onAttachmentUpload,
   onAttachmentDelete,
   onArchiveTask,
+  taskPermalink,
+  onPermalinkCopied,
+  suppressEscape = false,
 }) {
+  const modalRef = useRef(null);
   const [form, setForm] = useState({
     title: task?.title || "",
     description: task?.description || "",
     priority: task?.priority || "MEDIUM",
-    status: task?.status || "TODO",
+    status: task?.status || initialStatus || "TODO",
     assigneeId: task?.assigneeId || "",
     dueDate: task?.dueDate ? new Date(task.dueDate).toISOString().slice(0, 16) : "",
     tagIds: task?.tags?.map((t) => t.tagId) || [],
@@ -145,11 +312,39 @@ function TaskModal({
 
   useEffect(() => {
     function onKey(e) {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape" && !suppressEscape) onClose();
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [onClose, suppressEscape]);
+
+  useEffect(() => {
+    const root = modalRef.current;
+    if (!root) return undefined;
+    const sel = "#task-title, button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled])";
+    queueMicrotask(() => {
+      const first = root.querySelector(sel);
+      first?.focus({ preventScroll: true });
+    });
+    function trapTab(e) {
+      if (e.key !== "Tab") return;
+      const elems = [...root.querySelectorAll("button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled])")];
+      if (elems.length === 0) return;
+      const first = elems[0];
+      const last = elems[elems.length - 1];
+      if (e.shiftKey) {
+        if (document.activeElement === first) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else if (document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+    root.addEventListener("keydown", trapTab);
+    return () => root.removeEventListener("keydown", trapTab);
+  }, [task?.id, isEdit]);
 
   function toggleTag(tagId) {
     setForm((prev) => ({
@@ -161,6 +356,7 @@ function TaskModal({
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div
+        ref={modalRef}
         className="modal modal-task"
         onClick={(e) => e.stopPropagation()}
         role="dialog"
@@ -168,8 +364,16 @@ function TaskModal({
         aria-labelledby="task-modal-title"
       >
         <div className="modal-task-header">
+          <div className="modal-task-header-inner">
           <div>
-            <p className="modal-task-kicker">{isEdit ? "Редактирование" : "Создание"}</p>
+            <div className="modal-task-heading-row">
+              <p className="modal-task-kicker">{isEdit ? "Редактирование" : "Создание"}</p>
+              {isEdit && (
+                <span className="modal-status-badge" data-status={form.status}>
+                  {STATUS_LABELS[form.status] || form.status}
+                </span>
+              )}
+            </div>
             <h3 id="task-modal-title">{isEdit ? (form.title.trim() || "Задача") : "Новая задача"}</h3>
             <p className="modal-task-lead">
               {isEdit
@@ -177,9 +381,30 @@ function TaskModal({
                 : "Заполните основное и нажмите «Создать». Остальное добавите после сохранения."}
             </p>
           </div>
-          <button type="button" className="modal-task-close" aria-label="Закрыть" onClick={onClose}>
-            <CloseIcon />
-          </button>
+          <div className="modal-task-header-actions">
+            {isEdit && taskPermalink ? (
+              <button
+                type="button"
+                className="ghost modal-permalink-btn"
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(taskPermalink);
+                    onPermalinkCopied?.();
+                  } catch {
+                    onPermalinkCopied?.("Не удалось скопировать ссылку", "error");
+                  }
+                }}
+                title={taskPermalink}
+              >
+                <LinkIcon />
+                <span>Копировать ссылку</span>
+              </button>
+            ) : null}
+            <button type="button" className="modal-task-close" aria-label="Закрыть" onClick={onClose}>
+              <CloseIcon />
+            </button>
+          </div>
+          </div>
         </div>
 
         <div className="modal-task-body">
@@ -206,7 +431,12 @@ function TaskModal({
               </div>
               <div className="field field-span-full">
                 <label htmlFor="task-assignee">Исполнитель</label>
-                <select id="task-assignee" value={form.assigneeId} onChange={(e) => setForm({ ...form, assigneeId: e.target.value })} title={form.assigneeId ? (users.find((u) => String(u.id) === String(form.assigneeId))?.name ?? "") : ""}>
+                <select
+                  id="task-assignee"
+                  value={form.assigneeId === "" || form.assigneeId == null ? "" : String(form.assigneeId)}
+                  onChange={(e) => setForm({ ...form, assigneeId: e.target.value })}
+                  title={form.assigneeId ? (users.find((u) => String(u.id) === String(form.assigneeId))?.name ?? "") : ""}
+                >
                   <option value="">Не назначен</option>
                   {users.map((u) => <option key={u.id} value={u.id}>{u.name} — {ROLE_LABELS[u.role] || u.role}</option>)}
                 </select>
@@ -239,7 +469,19 @@ function TaskModal({
             <div className="modal-task-footer-main">
               <button
                 type="button"
-                onClick={() => onSave({ ...form, assigneeId: form.assigneeId ? Number(form.assigneeId) : null, dueDate: form.dueDate ? new Date(form.dueDate).toISOString() : null })}
+                onClick={() => {
+                  let assigneeId = null;
+                  const raw = form.assigneeId;
+                  if (raw !== "" && raw != null) {
+                    const n = Number(raw);
+                    assigneeId = Number.isFinite(n) && n > 0 ? n : null;
+                  }
+                  onSave({
+                    ...form,
+                    assigneeId,
+                    dueDate: form.dueDate ? new Date(form.dueDate).toISOString() : null,
+                  });
+                }}
               >
                 {isEdit ? "Сохранить карточку" : "Создать задачу"}
               </button>
@@ -441,9 +683,48 @@ export default function App() {
   const [filters, setFilters] = useState({ q: "", status: "", priority: "", assigneeId: "", overdue: false, tagId: "" });
   const [projectSearch, setProjectSearch] = useState("");
   const [dragOverColumn, setDragOverColumn] = useState(null);
+  const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const [toast, setToast] = useState(null);
+  const [sidebarHidden, setSidebarHidden] = useState(false);
+  const [draggingTaskId, setDraggingTaskId] = useState(null);
+  const [createTaskDefaults, setCreateTaskDefaults] = useState(null);
+  const [debouncedTaskQ, setDebouncedTaskQ] = useState("");
+  const [confirmDialog, setConfirmDialog] = useState(null);
   const notifRef = useRef(null);
+  const toastTimerRef = useRef(null);
+  const prevProjectIdRef = useRef(null);
+  const workspaceBootstrapRef = useRef(false);
+  const deepLinkTaskKeyRef = useRef("");
+  function pushToast(message, variant = "success") {
+    setToast({ message, variant });
+  }
+  const pushToastRef = useRef(pushToast);
+  pushToastRef.current = pushToast;
+
+  useEffect(() => {
+    if (!toast?.message) return;
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setToast(null), 3800);
+    return () => {
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    };
+  }, [toast]);
 
   useEffect(() => setToken(token), [token]);
+
+  useEffect(() => {
+    if (!token) {
+      setNetworkErrorNotifier(null);
+      return undefined;
+    }
+    setNetworkErrorNotifier((message, variant = "error") => pushToastRef.current(message, variant));
+    return () => setNetworkErrorNotifier(null);
+  }, [token]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedTaskQ(filters.q.trim()), 380);
+    return () => clearTimeout(timer);
+  }, [filters.q]);
 
   useEffect(() => {
     if (!showNotifications) return;
@@ -462,10 +743,101 @@ export default function App() {
     return () => window.removeEventListener("dragend", clearDrag);
   }, []);
 
+  useEffect(() => {
+    if (!token) {
+      workspaceBootstrapRef.current = false;
+      deepLinkTaskKeyRef.current = "";
+      return undefined;
+    }
+    return undefined;
+  }, [token]);
+
+  /** Закрываем модалку задачи при переключении проекта — карточка относится к другому контексту. */
+  useEffect(() => {
+    setModalTask((prev) => (prev && selectedProject && prev.projectId !== undefined && prev.projectId !== selectedProject.id ? null : prev));
+  }, [selectedProject?.id]);
+
+  useEffect(() => {
+    deepLinkTaskKeyRef.current = "";
+  }, [selectedProject?.id]);
+
+  /** Прямые ссылки вида ?project=&task=. */
+  useEffect(() => {
+    if (!token || typeof window === "undefined") return undefined;
+    const pid = selectedProject?.id ?? null;
+    const tid =
+      modalTask && selectedProject?.id === modalTask.projectId ? modalTask.id : null;
+    replaceWorkspaceLocation(pid, tid, modalTask?.projectId ?? selectedProject?.id);
+    return undefined;
+  }, [token, selectedProject?.id, modalTask?.id, modalTask?.projectId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function openFromUrl() {
+      if (!token || !selectedProject || workspaceLoading || typeof window === "undefined") return;
+      const { taskId } = parseWorkspaceQuery();
+      if (!taskId) {
+        deepLinkTaskKeyRef.current = "";
+        return;
+      }
+      const pendingMark = `${selectedProject.id}:${taskId}:pending`;
+      const doneMark = `${selectedProject.id}:${taskId}:done`;
+      const local = tasks.find((t) => t.id === taskId);
+      if (local && local.projectId === selectedProject.id) {
+        deepLinkTaskKeyRef.current = doneMark;
+        setModalTask((cur) => (cur?.id === local.id ? cur : local));
+        return;
+      }
+
+      if (deepLinkTaskKeyRef.current === doneMark || deepLinkTaskKeyRef.current === pendingMark) return;
+      deepLinkTaskKeyRef.current = pendingMark;
+
+      try {
+        const { data } = await api.get(`/tasks/${taskId}`);
+        if (cancelled) return;
+        if (!projects.some((p) => p.id === data.projectId)) {
+          pushToast("Нет доступа к задаче из ссылки", "error");
+          replaceWorkspaceLocation(selectedProject.id, null);
+          deepLinkTaskKeyRef.current = "";
+          return;
+        }
+        const proj = projects.find((p) => p.id === data.projectId);
+        if (proj && proj.id !== selectedProject.id) {
+          deepLinkTaskKeyRef.current = "";
+          setSelectedProject(proj);
+        }
+        setModalTask(data);
+        deepLinkTaskKeyRef.current = doneMark;
+      } catch (e) {
+        if (!cancelled) {
+          pushToast(extractApiErrorMessage(e), "error");
+          if (selectedProject?.id != null) replaceWorkspaceLocation(selectedProject.id, null);
+          deepLinkTaskKeyRef.current = "";
+        }
+      }
+    }
+    openFromUrl();
+    return () => {
+      cancelled = true;
+    };
+  }, [token, selectedProject?.id, workspaceLoading, tasks, projects]);
+
   async function loadProjects() {
     const { data } = await api.get("/projects");
     setProjects(data);
-    if (!selectedProject && data.length) setSelectedProject(data[0]);
+    setSelectedProject((cur) => {
+      if (!data.length) return null;
+      if (!workspaceBootstrapRef.current) {
+        workspaceBootstrapRef.current = true;
+        const { projectId: urlPid } = parseWorkspaceQuery();
+        if (urlPid) {
+          const hit = data.find((p) => p.id === urlPid);
+          if (hit) return hit;
+        }
+      }
+      if (cur && data.some((p) => p.id === cur.id)) return data.find((p) => p.id === cur.id);
+      return data[0] ?? null;
+    });
   }
   async function loadUsers() {
     try { const { data } = await api.get("/users"); setUsers(data); } catch { setUsers([]); }
@@ -483,8 +855,9 @@ export default function App() {
     setNotifications(data);
   }
   async function loadProjectData(projectId) {
+    if (!projectId) return;
     const params = {};
-    if (filters.q) params.q = filters.q;
+    if (debouncedTaskQ) params.q = debouncedTaskQ;
     if (filters.status) params.status = filters.status;
     if (filters.priority) params.priority = filters.priority;
     if (filters.assigneeId) params.assigneeId = Number(filters.assigneeId);
@@ -493,7 +866,7 @@ export default function App() {
     let result = tasksRes.data;
     if (filters.tagId) {
       const tagId = Number(filters.tagId);
-      result = result.filter((task) => (task.tags || []).some((t) => t.tagId === tagId));
+      result = result.filter((taskItem) => (taskItem.tags || []).some((t) => t.tagId === tagId));
     }
     setTasks(result);
     setStats(statsRes.data);
@@ -502,10 +875,27 @@ export default function App() {
   useEffect(() => { if (!token) return; loadProjects(); loadUsers(); }, [token]);
   useEffect(() => {
     if (!token || !selectedProject) return;
-    loadTags(selectedProject.id);
-    loadMembers(selectedProject.id);
-    loadProjectData(selectedProject.id);
-  }, [token, selectedProject?.id, filters.q, filters.status, filters.priority, filters.assigneeId, filters.overdue, filters.tagId]);
+    const pid = selectedProject.id;
+    let cancelled = false;
+    (async () => {
+      const switched = prevProjectIdRef.current !== pid;
+      if (switched) prevProjectIdRef.current = pid;
+      setWorkspaceLoading(true);
+      try {
+        if (switched) {
+          setTasks([]);
+          setStats(null);
+          await Promise.all([loadTags(pid), loadMembers(pid)]);
+        }
+        await loadProjectData(pid);
+      } finally {
+        if (!cancelled) setWorkspaceLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [token, selectedProject?.id, debouncedTaskQ, filters.status, filters.priority, filters.assigneeId, filters.overdue, filters.tagId]);
   useEffect(() => {
     if (!token) return;
     api.post("/notifications/scan").catch(() => null);
@@ -519,41 +909,66 @@ export default function App() {
     localStorage.setItem("user", JSON.stringify(nextUser));
   }
   function logout() {
-    setTokenState(null); setUser(null);
-    localStorage.removeItem("token"); localStorage.removeItem("user");
+    workspaceBootstrapRef.current = false;
+    deepLinkTaskKeyRef.current = "";
+    prevProjectIdRef.current = null;
+    setTokenState(null);
+    setUser(null);
+    localStorage.removeItem("token");
+    localStorage.removeItem("user");
+    if (typeof window !== "undefined") {
+      replaceWorkspaceLocation(null, null);
+    }
   }
 
   async function createProject(e) {
     e.preventDefault();
     if (!newProjectTitle.trim()) return;
     await api.post("/projects", { title: newProjectTitle, description: newProjectDesc });
-    setNewProjectTitle(""); setNewProjectDesc(""); await loadProjects();
+    setNewProjectTitle("");
+    setNewProjectDesc("");
+    await loadProjects();
+    pushToast("Проект создан");
   }
-  async function deleteProject() {
-    if (!selectedProject) return;
-    const ok = window.confirm(`Удалить проект "${selectedProject.title}"? Это действие необратимо.`);
-    if (!ok) return;
-    try {
-      await api.delete(`/projects/${selectedProject.id}`);
-      const { data } = await api.get("/projects");
-      setProjects(data);
-      setSelectedProject(data.length ? data[0] : null);
-      setTasks([]);
-      setStats(null);
-      setModalTask(null);
-    } catch (err) {
-      const msg = err?.response?.data?.message || "Не удалось удалить проект. Проверьте права (нужна роль менеджера в этом проекте).";
-      alert(msg);
-    }
+  function openDeleteProjectDialog() {
+    const p = selectedProject;
+    if (!p) return;
+    setConfirmDialog({
+      title: `Удалить проект «${p.title}»?`,
+      description:
+        "Будут удалены все задачи, комментарии, вложения по этому проекту и сам проект. Отменить действие нельзя.",
+      danger: true,
+      confirmText: "Удалить навсегда",
+      cancelText: "Отмена",
+      action: async () => {
+        await api.delete(`/projects/${p.id}`);
+        const { data } = await api.get("/projects");
+        setProjects(data);
+        setSelectedProject(data.length ? data[0] : null);
+        setTasks([]);
+        setStats(null);
+        setModalTask(null);
+        pushToast("Проект удалён");
+      },
+    });
   }
-  async function archiveProject() {
-    if (!selectedProject) return;
-    const ok = window.confirm(`Архивировать проект "${selectedProject.title}"?`);
-    if (!ok) return;
-    await api.post(`/projects/${selectedProject.id}/archive`);
-    const { data } = await api.get("/projects");
-    setProjects(data);
-    setSelectedProject(data.length ? data[0] : null);
+
+  function openArchiveProjectDialog() {
+    const p = selectedProject;
+    if (!p) return;
+    setConfirmDialog({
+      title: `Архивировать проект «${p.title}»?`,
+      description: "Проект будет скрыт из списка активных. По политике организации восстановление может выполнять администратор.",
+      confirmText: "В архив",
+      cancelText: "Отмена",
+      action: async () => {
+        await api.post(`/projects/${p.id}/archive`);
+        const { data } = await api.get("/projects");
+        setProjects(data);
+        setSelectedProject(data.length ? data[0] : null);
+        pushToast("Проект отправлен в архив");
+      },
+    });
   }
   async function createTag(e) {
     e.preventDefault();
@@ -574,9 +989,20 @@ export default function App() {
     await api.put(`/projects/${selectedProject.id}/members/${userId}`, { role });
     await loadMembers(selectedProject.id);
   }
-  async function removeMember(userId) {
-    await api.delete(`/projects/${selectedProject.id}/members/${userId}`);
-    await loadMembers(selectedProject.id);
+  function askRemoveMember(m) {
+    if (!selectedProject) return;
+    setConfirmDialog({
+      title: "Убрать участника из проекта?",
+      description: `${m.user.name} больше не увидит этот проект в списке.`,
+      danger: false,
+      confirmText: "Убрать",
+      cancelText: "Отмена",
+      action: async () => {
+        await api.delete(`/projects/${selectedProject.id}/members/${m.userId}`);
+        await loadMembers(selectedProject.id);
+        pushToast("Участник исключён из проекта");
+      },
+    });
   }
   async function saveTask(payload, existingTask) {
     try {
@@ -598,8 +1024,11 @@ export default function App() {
         setIsCreateTaskOpen(false);
       }
       await loadProjectData(selectedProject.id);
+      pushToast(existingTask ? "Изменения сохранены" : "Задача добавлена на доску");
     } catch (err) {
-      alert(err?.response?.data?.message || "Не удалось сохранить задачу");
+      if (err.response) {
+        pushToast(err.response.data?.message || "Не удалось сохранить задачу", "error");
+      }
     }
   }
   async function addComment(taskId, text) {
@@ -629,13 +1058,31 @@ export default function App() {
     setTasks(data); setModalTask(data.find((t) => t.id === taskId));
   }
   async function onTaskDrop(taskId, status) {
-    await api.put(`/tasks/${taskId}`, { status });
-    await loadProjectData(selectedProject.id);
+    const snapshot = tasks.map((x) => ({ ...x }));
+    setTasks((list) => list.map((t) => (t.id === taskId ? { ...t, status } : t)));
+    try {
+      await api.put(`/tasks/${taskId}`, { status });
+      await loadProjectData(selectedProject.id);
+    } catch (err) {
+      setTasks(snapshot);
+      if (err.response) pushToast(err.response.data?.message || "Не удалось переместить карточку", "error");
+      else pushToast(extractApiErrorMessage(err), "error");
+      await loadProjectData(selectedProject.id);
+    }
   }
-  async function archiveTask(taskId) {
-    await api.post(`/tasks/${taskId}/archive`);
-    await loadProjectData(selectedProject.id);
-    setModalTask(null);
+  function openArchiveTaskDialog(taskId) {
+    setConfirmDialog({
+      title: "Отправить задачу в архив?",
+      description: "Карточка исчезнет с канбана активных задач.",
+      confirmText: "В архив",
+      cancelText: "Отмена",
+      action: async () => {
+        await api.post(`/tasks/${taskId}/archive`);
+        await loadProjectData(selectedProject.id);
+        setModalTask(null);
+        pushToast("Задача в архиве");
+      },
+    });
   }
   async function uploadAttachment(taskId, file) {
     try {
@@ -645,8 +1092,11 @@ export default function App() {
       const { data } = await api.get(`/projects/${selectedProject.id}/tasks`);
       setTasks(data);
       setModalTask(data.find((t) => t.id === taskId));
+      pushToast("Файл прикреплён");
     } catch (err) {
-      alert(err?.response?.data?.message || "Не удалось загрузить файл");
+      if (err.response) {
+        pushToast(err.response.data?.message || "Не удалось загрузить файл", "error");
+      }
     }
   }
   async function deleteAttachment(taskId, attachmentId) {
@@ -665,14 +1115,32 @@ export default function App() {
     link.click();
     link.remove();
     window.URL.revokeObjectURL(blobUrl);
+    pushToast("CSV файл сформирован");
   }
   async function markNotificationRead(id) {
     await api.put(`/notifications/${id}/read`);
     await loadNotifications();
   }
+
+  async function markAllNotificationsRead() {
+    try {
+      await api.post("/notifications/read-all");
+      await loadNotifications();
+      pushToast("Все уведомления помечены прочитанными");
+    } catch (err) {
+      pushToast(extractApiErrorMessage(err), "error");
+    }
+  }
   function resetFilters() {
     setFilters({ q: "", status: "", priority: "", assigneeId: "", overdue: false, tagId: "" });
   }
+
+  const taskShareUrl = useMemo(() => {
+    if (!modalTask?.id || !selectedProject?.id) return "";
+    if (modalTask.projectId !== selectedProject.id) return "";
+    if (typeof window === "undefined") return "";
+    return `${window.location.origin}${window.location.pathname}?project=${selectedProject.id}&task=${modalTask.id}`;
+  }, [modalTask?.id, modalTask?.projectId, selectedProject?.id]);
 
   const grouped = useMemo(() => {
     const map = { TODO: [], IN_PROGRESS: [], REVIEW: [], DONE: [] };
@@ -690,12 +1158,30 @@ export default function App() {
     setFilters((f) => ({ ...f, status: f.status === status ? "" : status }));
   }
 
+  const showOverviewSkeleton = workspaceLoading && stats === null;
+  const showBoardSkeleton = workspaceLoading && stats === null;
+
   if (!token || !user) return <AuthForm onAuth={onAuth} />;
 
   return (
     <div className="app app-logged">
+      <a href="#main-workspace" className="skip-link">
+        Перейти к содержимому
+      </a>
       <div className="topbar-shell">
         <header className="topbar">
+          <div className="topbar-leading">
+            {sidebarHidden && (
+              <button
+                type="button"
+                className="ghost topbar-open-sidebar"
+                onClick={() => setSidebarHidden(false)}
+                aria-label="Показать панель проектов"
+              >
+                <PanelOpenIcon />
+                <span>Проекты</span>
+              </button>
+            )}
           <div className="topbar-brand">
             <div className="topbar-logo" aria-hidden>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -710,6 +1196,7 @@ export default function App() {
               <p className="topbar-subtitle">Проекты и канбан</p>
             </div>
           </div>
+          </div>
           <div className="topbar-actions">
             <div className="popover-anchor" ref={notifRef}>
               <button type="button" className="ghost btn-primary-icon" onClick={() => setShowNotifications((v) => !v)} aria-expanded={showNotifications}>
@@ -721,7 +1208,14 @@ export default function App() {
               </button>
               {showNotifications && (
                 <div className="notifications-dropdown card">
-                  <h4>Уведомления</h4>
+                  <div className="notifications-dropdown-head">
+                    <h4>Уведомления</h4>
+                    {notifications.some((n) => !n.read) ? (
+                      <button type="button" className="ghost notifications-read-all" onClick={() => markAllNotificationsRead()}>
+                        Прочитать всё
+                      </button>
+                    ) : null}
+                  </div>
                   {notifications.length === 0 && <p className="muted">Пока пусто</p>}
                   {notifications.map((n) => (
                     <div key={n.id} className={n.read ? "comment" : "comment unread"}>
@@ -742,10 +1236,16 @@ export default function App() {
           </div>
         </header>
       </div>
-      <div className="layout">
+      <div className={`layout${sidebarHidden ? " layout-sidebar-hidden" : ""}`}>
+        {!sidebarHidden && (
         <aside className="sidebar card">
-          <div className="sidebar-section-title">
-            <h3>Ваши проекты</h3>
+          <div className="sidebar-head-row">
+            <div className="sidebar-section-title">
+              <h3>Ваши проекты</h3>
+            </div>
+            <button type="button" className="icon-btn ghost sidebar-hide-btn" onClick={() => setSidebarHidden(true)} aria-label="Скрыть панель проектов" title="Скрыть панель проектов">
+              <PanelLeftIcon />
+            </button>
           </div>
           <p className="section-hint">Слева — список, справа — доска задач выбранного проекта.</p>
           <div className="project-search-wrap">
@@ -780,7 +1280,8 @@ export default function App() {
             </form>
           )}
         </aside>
-        <main className="main">
+        )}
+        <main id="main-workspace" className="main" tabIndex={-1}>
           {!selectedProject && projects.length > 0 && (
             <div className="empty-workspace card">
               <h2>Выберите проект слева</h2>
@@ -788,9 +1289,17 @@ export default function App() {
             </div>
           )}
           {projects.length === 0 && (
-            <div className="empty-workspace card">
-              <h2>Пока нет проектов</h2>
-              <p>Если у вас есть права администратора или менеджера, создайте первый проект в боковой панели.</p>
+            <div className="empty-workspace empty-workspace--start card">
+              <h2>Начните с первого проекта</h2>
+              <p className="empty-workspace-lead">Ниже — три шага, чтобы появился канбан и задачи для команды.</p>
+              <ol className="empty-steps">
+                <li>В боковой панели введите название и описание.</li>
+                <li>Нажмите «Создать проект».</li>
+                <li>Добавьте задачи и распределите по колонкам.</li>
+              </ol>
+              {(user.role === "EXECUTOR" || user.role === "VIEWER") && (
+                <p className="section-hint">Нужны права менеджера или администратора — они создают проекты для команды.</p>
+              )}
             </div>
           )}
           {selectedProject && (
@@ -806,7 +1315,14 @@ export default function App() {
                   </div>
                   <div className="hero-actions">
                     {(user.role === "ADMIN" || user.role === "MANAGER" || user.role === "EXECUTOR") && (
-                      <button type="button" className="btn-primary-icon" onClick={() => setIsCreateTaskOpen(true)}>
+                      <button
+                        type="button"
+                        className="btn-primary-icon"
+                        onClick={() => {
+                          setCreateTaskDefaults(null);
+                          setIsCreateTaskOpen(true);
+                        }}
+                      >
                         <PlusIcon />
                         Новая задача
                       </button>
@@ -815,13 +1331,39 @@ export default function App() {
                       <button type="button" className="ghost" onClick={exportReport}>Скачать CSV</button>
                     )}
                     {(user.role === "ADMIN" || user.role === "MANAGER") && (
-                      <button type="button" className="ghost danger" onClick={archiveProject}>В архив</button>
+                      <button type="button" className="ghost danger" onClick={openArchiveProjectDialog}>В архив</button>
                     )}
                     {(user.role === "ADMIN" || user.role === "MANAGER") && (
-                      <button type="button" className="ghost danger" onClick={deleteProject}>Удалить проект</button>
+                      <button type="button" className="ghost danger" onClick={openDeleteProjectDialog}>Удалить проект</button>
                     )}
                   </div>
                 </div>
+
+                {stats && stats.total === 0 && !workspaceLoading && (
+                  <div className="project-zero-banner" aria-label="Подсказка для пустого проекта">
+                    <div className="project-zero-banner-text">
+                      <strong>Пока нет ни одной задачи</strong>
+                      <span>Создайте первую карточку — она появится в колонке «К выполнению», затем её можно двигать по доске.</span>
+                    </div>
+                    {(user.role === "ADMIN" || user.role === "MANAGER" || user.role === "EXECUTOR") && (
+                      <button
+                        type="button"
+                        className="btn-primary-icon project-zero-banner-cta"
+                        onClick={() => {
+                          setCreateTaskDefaults({ status: "TODO" });
+                          setIsCreateTaskOpen(true);
+                        }}
+                      >
+                        <PlusIcon />
+                        Первая задача
+                      </button>
+                    )}
+                  </div>
+                )}
+                {showOverviewSkeleton ? (
+                  <WorkspaceSkeleton />
+                ) : (
+                  <>
                 {stats && (
                   <div className="stats stats-compact" aria-label="Сводка по задачам">
                     <div className="stat stat-pill"><span className="stat-name">Всего</span><b>{stats.total}</b></div>
@@ -905,43 +1447,63 @@ export default function App() {
                     </form>
                   </div>
                 </details>
+                  </>
+                )}
 
-                <details className="details-block">
-                  <summary>Команда и права доступа</summary>
-                  <div className="details-body members-inner">
-                    {(user.role === "ADMIN" || user.role === "MANAGER") && (
-                      <form className="row" onSubmit={addMember}>
-                        <select value={memberUserId} onChange={(e) => setMemberUserId(e.target.value)} aria-label="Пользователь">
-                          <option value="">Кого добавить</option>
-                          {users.map((u) => <option key={u.id} value={u.id}>{u.name} ({u.email})</option>)}
-                        </select>
-                        <select value={memberRole} onChange={(e) => setMemberRole(e.target.value)} aria-label="Роль в проекте">
-                          <option value="MANAGER">Менеджер</option>
-                          <option value="MEMBER">Участник</option>
-                          <option value="VIEWER">Наблюдатель</option>
-                        </select>
-                        <button type="submit">Добавить</button>
-                      </form>
-                    )}
-                    {members.map((m) => (
-                      <div className="member-row" key={m.userId}>
-                        <span>{m.user.name}</span>
-                        <select value={m.role} onChange={(e) => updateMemberRole(m.userId, e.target.value)} disabled={!(user.role === "ADMIN" || user.role === "MANAGER")}>
-                          <option value="OWNER">Владелец</option>
-                          <option value="MANAGER">Менеджер</option>
-                          <option value="MEMBER">Участник</option>
-                          <option value="VIEWER">Наблюдатель</option>
-                        </select>
-                        <span className="muted">{MEMBER_ROLE_LABELS[m.role]}</span>
-                        {(user.role === "ADMIN" || user.role === "MANAGER") && m.userId !== user.id && (
-                          <button type="button" className="ghost" onClick={() => removeMember(m.userId)}>Убрать</button>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                </details>
+                {!showOverviewSkeleton && (
+                <>
+                  <details className="details-block">
+                    <summary>Команда и права доступа</summary>
+                    <div className="details-body members-inner">
+                      {(user.role === "ADMIN" || user.role === "MANAGER") && (
+                        <form className="row" onSubmit={addMember}>
+                          <select value={memberUserId} onChange={(e) => setMemberUserId(e.target.value)} aria-label="Пользователь">
+                            <option value="">Кого добавить</option>
+                            {users.map((u) => <option key={u.id} value={u.id}>{u.name} ({u.email})</option>)}
+                          </select>
+                          <select value={memberRole} onChange={(e) => setMemberRole(e.target.value)} aria-label="Роль в проекте">
+                            <option value="MANAGER">Менеджер</option>
+                            <option value="MEMBER">Участник</option>
+                            <option value="VIEWER">Наблюдатель</option>
+                          </select>
+                          <button type="submit">Добавить</button>
+                        </form>
+                      )}
+                      {members.map((m) => (
+                        <div className="member-row" key={m.userId}>
+                          <span>{m.user.name}</span>
+                          <select value={m.role} onChange={(e) => updateMemberRole(m.userId, e.target.value)} disabled={!(user.role === "ADMIN" || user.role === "MANAGER")}>
+                            <option value="OWNER">Владелец</option>
+                            <option value="MANAGER">Менеджер</option>
+                            <option value="MEMBER">Участник</option>
+                            <option value="VIEWER">Наблюдатель</option>
+                          </select>
+                          <span className="muted">{MEMBER_ROLE_LABELS[m.role]}</span>
+                          {(user.role === "ADMIN" || user.role === "MANAGER") && m.userId !== user.id && (
+                            <button type="button" className="ghost" onClick={() => askRemoveMember(m)}>Убрать</button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+
+                  <details className="help-sheet">
+                    <summary>Краткая справка по интерфейсу</summary>
+                    <ul className="help-sheet-list">
+                      <li>Карточки перетаскивайте между колонками — статус сохранится автоматически.</li>
+                      <li>В карточке задачи сохраните поля сверху, затем пользуйтесь вкладками: чек-лист, обсуждение, время, файлы.</li>
+                      <li>Поиск по задачам применится через доли секунды после ввода; сброс — кнопка «Сбросить» над чипами.</li>
+                      <li>Раздел ниже задаёт фильтры, теги и состав команды проекта по ролям.</li>
+                      <li>Откройте задачу по ссылке: в адресной строке сохранятся параметры «проект» и «задача»; кнопка «Копировать ссылку» в шапке карточки кладёт её в буфер.</li>
+                    </ul>
+                  </details>
+                </>
+                )}
               </section>
 
+              {showBoardSkeleton ? (
+                <BoardSkeleton />
+              ) : (
               <div className="board-region board-surface">
                 <div className="board-header">
                   <div>
@@ -949,7 +1511,15 @@ export default function App() {
                     <p className="hint-line">Перетащите карточку между колонками или нажмите на неё, чтобы открыть детали.</p>
                   </div>
                   {(user.role === "ADMIN" || user.role === "MANAGER" || user.role === "EXECUTOR") && (
-                    <button type="button" className="btn-primary-icon board-fab" onClick={() => setIsCreateTaskOpen(true)} title="Быстро добавить задачу на доску">
+                    <button
+                      type="button"
+                      className="btn-primary-icon board-fab"
+                      onClick={() => {
+                        setCreateTaskDefaults(null);
+                        setIsCreateTaskOpen(true);
+                      }}
+                      title="Быстро добавить задачу на доску"
+                    >
                       <PlusIcon />
                       <span className="board-fab-text">Задача</span>
                     </button>
@@ -976,10 +1546,15 @@ export default function App() {
                     {(grouped[status] || []).map((task) => (
                       <div
                         key={task.id}
-                        className="task"
+                        className={`task${draggingTaskId === task.id ? " task--dragging" : ""}`}
                         draggable
                         data-priority={task.priority}
-                        onDragStart={(e) => e.dataTransfer.setData("text/plain", String(task.id))}
+                        onDragStart={(e) => {
+                          e.dataTransfer.setData("text/plain", String(task.id));
+                          e.dataTransfer.effectAllowed = "move";
+                          setDraggingTaskId(task.id);
+                        }}
+                        onDragEnd={() => setDraggingTaskId(null)}
                         onClick={() => setModalTask(task)}
                       >
                         <div className="task-title">{task.title}</div>
@@ -997,23 +1572,57 @@ export default function App() {
                         </div>
                       </div>
                     ))}
-                    {(grouped[status] || []).length === 0 && <p className="empty-column">Перетащите сюда задачу или создайте новую</p>}
+                    {(grouped[status] || []).length === 0 && (
+                      <div className="empty-column-slot">
+                        <p className="empty-column-title">Нет задач</p>
+                        <p className="empty-column-hint">Перетащите сюда карточку с другой колонки или создайте задачу.</p>
+                        {(user.role === "ADMIN" || user.role === "MANAGER" || user.role === "EXECUTOR") && (
+                          <button
+                            type="button"
+                            className="ghost empty-column-action"
+                            onClick={() => {
+                              setCreateTaskDefaults({ status });
+                              setIsCreateTaskOpen(true);
+                            }}
+                          >
+                            + В этой колонке
+                          </button>
+                        )}
+                      </div>
+                    )}
                     </div>
                   </div>
                 ))}
                 </section>
               </div>
+              )}
             </>
           )}
         </main>
       </div>
 
-      {isCreateTaskOpen && <TaskModal users={users} tags={tags} onClose={() => setIsCreateTaskOpen(false)} onSave={(payload) => saveTask(payload, null)} />}
+      {isCreateTaskOpen && (
+        <TaskModal
+          key={createTaskDefaults?.status ? `new-${createTaskDefaults.status}` : "new-task"}
+          suppressEscape={!!confirmDialog}
+          initialStatus={createTaskDefaults?.status}
+          users={users}
+          tags={tags}
+          onClose={() => {
+            setIsCreateTaskOpen(false);
+            setCreateTaskDefaults(null);
+          }}
+          onSave={(payload) => saveTask(payload, null)}
+        />
+      )}
       {modalTask && (
         <TaskModal
+          suppressEscape={!!confirmDialog}
           task={modalTask}
           users={users}
           tags={tags}
+          taskPermalink={taskShareUrl || undefined}
+          onPermalinkCopied={(msg, variant) => pushToast(msg ?? "Ссылка скопирована", variant ?? "success")}
           onClose={() => setModalTask(null)}
           onSave={(payload) => saveTask(payload, modalTask)}
           onComment={(text) => addComment(modalTask.id, text)}
@@ -1023,9 +1632,25 @@ export default function App() {
           onChecklistDelete={(itemId) => deleteChecklist(itemId, modalTask.id)}
           onAttachmentUpload={(file) => uploadAttachment(modalTask.id, file)}
           onAttachmentDelete={(attachmentId) => deleteAttachment(modalTask.id, attachmentId)}
-          onArchiveTask={() => archiveTask(modalTask.id)}
+          onArchiveTask={() => openArchiveTaskDialog(modalTask.id)}
         />
       )}
+
+      {confirmDialog && (
+        <ConfirmModal
+          config={confirmDialog}
+          onClose={() => setConfirmDialog(null)}
+          notifyError={(message) => pushToast(message, "error")}
+        />
+      )}
+
+      <div className="toast-host" aria-live="polite">
+        {toast?.message && (
+          <div className={`toast-item toast-item--${toast.variant || "success"}`} role="status">
+            {toast.message}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
