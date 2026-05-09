@@ -1,0 +1,14 @@
+node_modules
+.env
+.env.*
+dist
+build
+coverage
+backend/prisma/dev.db
+backend/prisma/dev.db-journal
+
+# служебные папки Cursor (не часть диплома)
+agent-transcripts/
+mcps/
+terminals/
+.cursor/

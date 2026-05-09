@@ -1,0 +1,38 @@
+services:
+  db:
+    image: postgres:16
+    container_name: diploma_pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: diploma_pm
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ./backend
+    container_name: diploma_backend
+    depends_on:
+      - db
+    environment:
+      PORT: 4000
+      JWT_SECRET: super-secret-key
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/diploma_pm?schema=public
+    ports:
+      - "4000:4000"
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: diploma_frontend
+    depends_on:
+      - backend
+    ports:
+      - "5173:5173"
+
+volumes:
+  pgdata:
