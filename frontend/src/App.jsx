@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, setToken } from "./api";
+import { api, setToken, API_BASE } from "./api";
 
 const STATUS_COLUMNS = ["TODO", "IN_PROGRESS", "REVIEW", "DONE"];
 const STATUS_LABELS = {
@@ -178,7 +178,7 @@ function TaskModal({
             <div className="comments">
               {(task.attachments || []).map((a) => (
                 <div className="comment" key={a.id}>
-                  <a href={`http://localhost:4000/uploads/${a.fileName}`} target="_blank" rel="noreferrer">{a.originalName}</a>
+                  <a href={`${API_BASE}/uploads/${a.fileName}`} target="_blank" rel="noreferrer">{a.originalName}</a>
                   <button className="ghost" onClick={() => onAttachmentDelete(a.id)}>Удалить</button>
                 </div>
               ))}
